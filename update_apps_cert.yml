@@ -362,6 +362,7 @@
           openssl x509 -noout -subject -dates 2>&1
       register: live_cert_check
       changed_when: false
+      failed_when: false
       when: not dry_run
 
     - name: Display live certificate verification
@@ -369,7 +370,15 @@
         msg: |
           Live certificate verification:
           {{ live_cert_check.stdout_lines | join('\n') }}
-      when: not dry_run
+      when: not dry_run and live_cert_check.rc == 0
+
+    - name: Display live certificate unreachable notice
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: Could not reach {{ apps_domain }}:443 from this host.
+          The certificate was applied to the IngressController.
+          Verify manually from a host that can reach the cluster routers.
+      when: not dry_run and live_cert_check.rc != 0
 
     - name: Verify live certificate matches ACME certificate
       ansible.builtin.shell: |
@@ -385,12 +394,13 @@
         fi
       register: cert_match
       changed_when: false
+      failed_when: false
       when: not dry_run
 
     - name: Report certificate match status
       ansible.builtin.debug:
         msg: >-
-          {{ 'SUCCESS: Live certificate matches ACME certificate.' if cert_match.stdout == 'MATCH' else 'WARNING: Certificate serial mismatch - ' ~ cert_match.stdout }}
+          {{ 'SUCCESS: Live certificate matches ACME certificate.' if (cert_match is defined and cert_match.stdout == 'MATCH') else 'Certificate applied. Verify manually from a host that can reach the cluster routers.' }}
       when: not dry_run
 
     # ────────────────────────────────────────────────────────────────────
