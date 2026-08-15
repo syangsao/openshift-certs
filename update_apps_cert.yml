@@ -1,0 +1,410 @@
+# playbook: update_apps_cert.yml
+# purpose: Update the OpenShift default ingress (apps) TLS certificate
+#           with an ACME-generated certificate from ~/.acme.sh/
+#
+# prerequisites:
+#   - ansible-core >= 2.14
+#   - oc CLI available on the host running the playbook
+#   - valid kubeconfig with cluster-admin privileges
+#   - acme.sh certificate already issued for *.apps.<domain>
+#
+# usage:
+#   ansible-playbook -i inventory.ini update_apps_cert.yml \
+#     -e kubeconfig_path=/path/to/kubeconfig \
+#     -e apps_domain=apps.luke.syangsao.net \
+#     -e acme_home=~/.acme.sh \
+#     -e ingress_namespace=openshift-ingress \
+#     -e ingress_controller_namespace=openshift-ingress-operator \
+#     -e ingress_controller_name=default \
+#     -e backup_dir=/tmp/openshift-certs-backup \
+#     -e dry_run=false
+#
+#   Dry run (preview only):
+#     ansible-playbook -i inventory.ini update_apps_cert.yml \
+#       -e apps_domain=apps.luke.syangsao.net \
+#       -e dry_run=true
+
+- name: Update OpenShift Apps (Ingress) TLS Certificate
+  hosts: localhost
+  connection: local
+  gather_facts: true
+
+  vars:
+    # ── Override these via -e ────────────────────────────────────────────
+    kubeconfig_path: "{{ lookup('env', 'KUBECONFIG', default='~/.kube/config') }}"
+    apps_domain: ""
+    acme_home: "~/acme.sh"
+    ingress_namespace: openshift-ingress
+    ingress_controller_namespace: openshift-ingress-operator
+    ingress_controller_name: default
+    backup_dir: /tmp/openshift-certs-backup
+    dry_run: false
+    # ────────────────────────────────────────────────────────────────────
+
+    # ACME cert paths (derived from apps_domain)
+    acme_domain: "*.{{ apps_domain }}"
+    acme_dir: "{{ acme_home }}/{{ acme_domain }}_ecc"
+    acme_fullchain: "{{ acme_dir }}/fullchain.cer"
+    acme_key: "{{ acme_dir }}/{{ acme_domain }}.key"
+
+    # Secret name for the new certificate
+    new_secret_name: router-custom-certs
+
+    # How many days before expiry to flag as "expiring soon"
+    expiring_soon_days: 30
+
+  environment:
+    KUBECONFIG: "{{ kubeconfig_path | expanduser }}"
+
+  tasks:
+
+    # ────────────────────────────────────────────────────────────────────
+    # Phase 0: Validate inputs
+    # ────────────────────────────────────────────────────────────────────
+    - name: Validate required variables
+      ansible.builtin.assert:
+        that:
+          - apps_domain | length > 0
+          - kubeconfig_path | length > 0
+        fail_msg: "apps_domain and kubeconfig_path must be set."
+
+    - name: Verify oc CLI is available
+      ansible.builtin.command: oc version --client --short
+      register: oc_version
+      changed_when: false
+
+    - name: Display oc version
+      ansible.builtin.debug:
+        var: oc_version.stdout
+
+    # ────────────────────────────────────────────────────────────────────
+    # Phase 1: Check current apps certificate status
+    # ────────────────────────────────────────────────────────────────────
+    - name: Retrieve current default certificate secret name
+      ansible.builtin.command: >
+        oc get ingresscontroller {{ ingress_controller_name }}
+        -n {{ ingress_controller_namespace }}
+        -o jsonpath='{.spec.defaultCertificate.name}'
+      register: ic_default_cert
+      changed_when: false
+
+    - name: Display current default certificate secret
+      ansible.builtin.debug:
+        msg: "Current defaultCertificate secret: {{ ic_default_cert.stdout }}"
+
+    - name: Extract current apps certificate from secret
+      ansible.builtin.command: >
+        oc get secret {{ ic_default_cert.stdout }}
+        -n {{ ingress_namespace }}
+        -o jsonpath='{.data.tls\\.crt}'
+      register: current_cert_b64
+      changed_when: false
+
+    - name: Decode and inspect current apps certificate
+      ansible.builtin.shell: |
+        echo "{{ current_cert_b64.stdout }}" | base64 -d | \
+          openssl x509 -noout -subject -dates 2>&1
+      register: current_cert_info
+      changed_when: false
+
+    - name: Display current apps certificate details
+      ansible.builtin.debug:
+        msg: "{{ current_cert_info.stdout_lines | join('\n') }}"
+
+    - name: Parse current certificate expiry date
+      ansible.builtin.shell: |
+        echo "{{ current_cert_b64.stdout }}" | base64 -d | \
+          openssl x509 -noout -enddate | sed 's/notAfter=//'
+      register: raw_expiry
+      changed_when: false
+
+    - name: Calculate days until expiry
+      ansible.builtin.shell: |
+        now=$(date +%s)
+        expiry=$(date -d "{{ raw_expiry.stdout }}" +%s)
+        echo $(( (expiry - now) / 86400 ))
+      register: days_calc
+      changed_when: false
+
+    - name: Report certificate expiry status
+      ansible.builtin.debug:
+        msg: >-
+          Current apps certificate expires in {{ days_calc.stdout }} days
+          ({{ 'EXPIRED or EXPIRING SOON' if (days_calc.stdout | int) <= expiring_soon_days else 'still valid' }})
+
+    # ────────────────────────────────────────────────────────────────────
+    # Phase 2: Verify ACME certificate exists and is valid
+    # ────────────────────────────────────────────────────────────────────
+    - name: Check ACME certificate directory exists
+      ansible.builtin.stat:
+        path: "{{ acme_dir | expanduser }}"
+      register: acme_dir_stat
+
+    - name: Fail if ACME certificate directory not found
+      ansible.builtin.fail:
+        msg: >
+          ACME certificate directory not found at {{ acme_dir }}.
+          Run: acme.sh --issue --dns dns_easydns --domain {{ acme_domain }} --force
+      when: not acme_dir_stat.stat.exists
+
+    - name: Check ACME fullchain certificate exists
+      ansible.builtin.stat:
+        path: "{{ acme_fullchain | expanduser }}"
+      register: acme_fullchain_stat
+
+    - name: Check ACME private key exists
+      ansible.builtin.stat:
+        path: "{{ acme_key | expanduser }}"
+      register: acme_key_stat
+
+    - name: Fail if ACME certificate files not found
+      ansible.builtin.fail:
+        msg: >
+          ACME certificate or key not found.
+          fullchain: {{ acme_fullchain }} ({{ acme_fullchain_stat.stat.exists | ternary('OK', 'MISSING') }})
+          key: {{ acme_key }} ({{ acme_key_stat.stat.exists | ternary('OK', 'MISSING') }})
+      when: not acme_fullchain_stat.stat.exists or not acme_key_stat.stat.exists
+
+    - name: Inspect ACME certificate details
+      ansible.builtin.shell: |
+        openssl x509 -in "{{ acme_fullchain | expanduser }}" -noout -subject -dates 2>&1
+      register: acme_cert_info
+      changed_when: false
+
+    - name: Display ACME certificate details
+      ansible.builtin.debug:
+        msg: "{{ acme_cert_info.stdout_lines | join('\n') }}"
+
+    - name: Verify ACME certificate is not expired
+      ansible.builtin.shell: |
+        openssl x509 -in "{{ acme_fullchain | expanduser }}" -noout -checkend 0 2>&1
+        echo "EXIT:$?"
+      register: acme_not_expired
+      changed_when: false
+
+    - name: Fail if ACME certificate is expired
+      ansible.builtin.fail:
+        msg: "The ACME certificate at {{ acme_fullchain }} is expired. Renew it first."
+      when: "'EXIT:1' in acme_not_expired.stdout"
+
+    - name: Verify ACME certificate matches the apps domain
+      ansible.builtin.shell: |
+        openssl x509 -in "{{ acme_fullchain | expanduser }}" -noout -text 2>/dev/null | \
+          grep -A1 'Subject Alternative Name' | tail -1 | \
+          grep -c '{{ apps_domain }}'
+      register: san_match
+      changed_when: false
+
+    - name: Fail if SAN does not match apps domain
+      ansible.builtin.fail:
+        msg: "ACME certificate SAN does not include *.{{ apps_domain }}"
+      when: san_match.stdout != "1"
+
+    # ────────────────────────────────────────────────────────────────────
+    # Phase 3: Interactive confirmation
+    # ────────────────────────────────────────────────────────────────────
+    - name: Prompt user to confirm certificate update
+      ansible.builtin.pause:
+        prompt: |
+          ┌─────────────────────────────────────────────────────────────┐
+          │  Apps Certificate Update                                    │
+          ├─────────────────────────────────────────────────────────────┤
+          │  Current cert expires in {{ days_calc.stdout }} days        │
+          │  New cert (ACME): {{ acme_cert_info.stdout_lines[0] | truncate(60) }} │
+          │  Target secret: {{ new_secret_name }} in {{ ingress_namespace }} │
+          │  IngressController: {{ ingress_controller_name }}           │
+          ├─────────────────────────────────────────────────────────────┤
+          │  Press ENTER to proceed, or Ctrl+C to abort.               │
+          └─────────────────────────────────────────────────────────────┘
+      when: not dry_run
+
+    # ────────────────────────────────────────────────────────────────────
+    # Phase 4: Backup current OpenShift configuration
+    # ────────────────────────────────────────────────────────────────────
+    - name: Create backup directory
+      ansible.builtin.file:
+        path: "{{ backup_dir }}"
+        state: directory
+        mode: "0700"
+      when: not dry_run
+
+    - name: Generate backup timestamp
+      ansible.builtin.shell: date +%Y%m%d%H%M%S
+      register: backup_ts
+      changed_when: false
+      when: not dry_run
+
+    - name: Backup current IngressController configuration
+      ansible.builtin.command: >
+        oc get ingresscontroller {{ ingress_controller_name }}
+        -n {{ ingress_controller_namespace }}
+        -o yaml
+      register: ic_backup
+      changed_when: false
+      when: not dry_run
+
+    - name: Save IngressController backup to file
+      ansible.builtin.copy:
+        content: "{{ ic_backup.stdout }}"
+        dest: "{{ backup_dir }}/ingresscontroller_{{ ingress_controller_name }}_{{ backup_ts.stdout }}.yaml"
+        mode: "0600"
+      when: not dry_run
+
+    - name: Backup current default certificate secret
+      ansible.builtin.command: >
+        oc get secret {{ ic_default_cert.stdout }}
+        -n {{ ingress_namespace }}
+        -o yaml
+      register: cert_backup
+      changed_when: false
+      when: not dry_run
+
+    - name: Save certificate secret backup to file
+      ansible.builtin.copy:
+        content: "{{ cert_backup.stdout }}"
+        dest: "{{ backup_dir }}/secret_{{ ic_default_cert.stdout }}_{{ backup_ts.stdout }}.yaml"
+        mode: "0600"
+      when: not dry_run
+
+    - name: Display backup location
+      ansible.builtin.debug:
+        msg: "Configuration backed up to {{ backup_dir }}/"
+      when: not dry_run
+
+    # ────────────────────────────────────────────────────────────────────
+    # Phase 5: Create/update TLS secret with ACME certificate
+    # ────────────────────────────────────────────────────────────────────
+    - name: Remove existing custom cert secret if present
+      ansible.builtin.command: >
+        oc delete secret {{ new_secret_name }}
+        -n {{ ingress_namespace }}
+        --ignore-not-found
+      register: delete_old_secret
+      changed_when: "'deleted' in delete_old_secret.stdout"
+      when: not dry_run
+
+    - name: Create TLS secret from ACME certificate
+      ansible.builtin.command: >
+        oc create secret tls {{ new_secret_name }}
+        --cert={{ acme_fullchain | expanduser }}
+        --key={{ acme_key | expanduser }}
+        -n {{ ingress_namespace }}
+      register: create_secret
+      changed_when: "'created' in create_secret.stdout"
+      when: not dry_run
+
+    - name: Verify secret was created
+      ansible.builtin.command: >
+        oc get secret {{ new_secret_name }}
+        -n {{ ingress_namespace }}
+        -o jsonpath='{.data.tls\\.crt}'
+      register: new_secret_check
+      changed_when: false
+      when: not dry_run
+
+    - name: Display new secret confirmation
+      ansible.builtin.debug:
+        msg: "Secret {{ new_secret_name }} created in {{ ingress_namespace }}."
+      when: not dry_run
+
+    # ────────────────────────────────────────────────────────────────────
+    # Phase 6: Update IngressController to use new certificate
+    # ────────────────────────────────────────────────────────────────────
+    - name: Patch IngressController to use new default certificate
+      ansible.builtin.command: >
+        oc patch ingresscontroller {{ ingress_controller_name }}
+        -n {{ ingress_controller_namespace }}
+        --type=merge
+        -p '{"spec":{"defaultCertificate":{"name":"{{ new_secret_name }}"}}}'
+      register: patch_ic
+      changed_when: "'patched' in patch_ic.stdout"
+      when: not dry_run
+
+    - name: Display IngressController patch result
+      ansible.builtin.debug:
+        msg: "{{ patch_ic.stdout }}"
+      when: not dry_run
+
+    # ────────────────────────────────────────────────────────────────────
+    # Phase 7: Wait for rollout and validate
+    # ────────────────────────────────────────────────────────────────────
+    - name: Wait for router deployment rollout
+      ansible.builtin.command: >
+        oc rollout status deploy/router-default
+        -n {{ ingress_namespace }}
+        --timeout=300s
+      register: rollout_status
+      changed_when: false
+      when: not dry_run
+
+    - name: Verify IngressController is available
+      ansible.builtin.command: >
+        oc get ingresscontroller {{ ingress_controller_name }}
+        -n {{ ingress_controller_namespace }}
+        -o jsonpath='{.status.conditions[?(@.type=="Available")].status}'
+      register: ic_available
+      changed_when: false
+      retries: 6
+      delay: 10
+      until: ic_available.stdout == "True"
+      when: not dry_run
+
+    - name: Verify new certificate is serving on the apps domain
+      ansible.builtin.shell: |
+        echo | openssl s_client -connect {{ apps_domain }}:443 \
+          -servername {{ apps_domain }} 2>/dev/null | \
+          openssl x509 -noout -subject -dates 2>&1
+      register: live_cert_check
+      changed_when: false
+      when: not dry_run
+
+    - name: Display live certificate verification
+      ansible.builtin.debug:
+        msg: |
+          Live certificate verification:
+          {{ live_cert_check.stdout_lines | join('\n') }}
+      when: not dry_run
+
+    - name: Verify live certificate matches ACME certificate
+      ansible.builtin.shell: |
+        live_serial=$(echo | openssl s_client -connect {{ apps_domain }}:443 \
+          -servername {{ apps_domain }} 2>/dev/null | \
+          openssl x509 -noout -serial 2>/dev/null | cut -d= -f2)
+        acme_serial=$(openssl x509 -in "{{ acme_fullchain | expanduser }}" \
+          -noout -serial 2>/dev/null | cut -d= -f2)
+        if [ "$live_serial" = "$acme_serial" ]; then
+          echo "MATCH"
+        else
+          echo "MISMATCH: live=$live_serial acme=$acme_serial"
+        fi
+      register: cert_match
+      changed_when: false
+      when: not dry_run
+
+    - name: Report certificate match status
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'SUCCESS: Live certificate matches ACME certificate.' if cert_match.stdout == 'MATCH' else 'WARNING: Certificate serial mismatch - ' ~ cert_match.stdout }}
+      when: not dry_run
+
+    # ────────────────────────────────────────────────────────────────────
+    # Phase 8: Summary
+    # ────────────────────────────────────────────────────────────────────
+    - name: Print final summary
+      ansible.builtin.debug:
+        msg: |
+          ┌─────────────────────────────────────────────────────────────┐
+          │  Apps Certificate Update Complete                           │
+          ├─────────────────────────────────────────────────────────────┤
+          │  Secret: {{ new_secret_name }} ({{ ingress_namespace }})     │
+          │  IngressController: {{ ingress_controller_name }}           │
+          │  Certificate: {{ acme_cert_info.stdout_lines[0] | truncate(60) }} │
+          │  Backup: {{ backup_dir }}/                                  │
+          │  Status: {{ 'VERIFIED' if (cert_match is defined and cert_match.stdout == 'MATCH') else 'APPLIED' }} │
+          └─────────────────────────────────────────────────────────────┘
+      when: not dry_run
+
+    - name: Dry run notice
+      ansible.builtin.debug:
+        msg: "DRY RUN - no changes were made. Remove '-e dry_run=true' to apply."
+      when: dry_run
